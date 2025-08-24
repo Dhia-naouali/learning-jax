@@ -113,4 +113,4 @@ class DenseNet(nn.Module):
         x = jnp.reshape(x, (*x.shape[:-3], -1)) # bs?, -1
         return self.fc(x)
 
-densenet_ = partial(DenseNet, Bottleneck, (6, 12, 24, 16), growth_rate=12)
+densenet_ = partial(DenseNet, Bottleneck, (6, 12, 16, 16), growth_rate=8)

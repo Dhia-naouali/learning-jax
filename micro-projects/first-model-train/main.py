@@ -1,40 +1,24 @@
 import os
-import tqdm
 import wandb
 import collections
-from ml_collections import config_flags, config_dict
+from absl import app
+from tqdm import tqdm
 
-from absl import flags, app
 import jax
 import jax.numpy as jnp
 from jax import tree_util
-import flax.linen as nn
 
-import jaxopt
 import optax
+import jaxopt
+import flax.linen as nn
 
 import numpy as np
 from torch.utils.data import DataLoader
 from torchvision import transforms, datasets
 
 from models import densenet_
+from config import get_config
 
-flags.DEFINE_string("dataset_root", "data", "path to data directory")
-flags.DEFINE_bool("download", True, "download dataset")
-flags.DEFINE_integer("loader_prefetch_factor", 2, "prefetch factor for loader")
-
-flags.DEFINE_integer("train_batch_size", 32, "")
-flags.DEFINE_integer("eval_batch_size", 128, "")
-flags.DEFINE_integer("epochs", 32, "")
-flags.DEFINE_float("init_learning_rate", 3e-4, "")
-flags.DEFINE_float("weight_decay", 1e-2, "")
-config_flags.DEFINE_config_file("config")
-
-
-# train_batch_size, val_batch_size, epochs, init_learning_rate, weight_decay
-
-
-FLAGS = flags.FLAGS
 
 def setup_data(config):
     transform_train = transforms.Compose([
@@ -49,8 +33,8 @@ def setup_data(config):
         transforms.Normalize(0.5, 1.0),
     ])
     
-    train_dataset = datasets.CIFAR10(FLAGS.dataset_root, download=FLAGS.download, train=True, transform=transform_train)
-    val_dataset = datasets.CIFAR10(FLAGS.dataset_root, download=FLAGS.download, train=False, transform=transform_val)
+    train_dataset = datasets.CIFAR10(config.data_dir, download=config.download, train=True, transform=transform_train)
+    val_dataset = datasets.CIFAR10(config.data_dir, download=config.download, train=False, transform=transform_val)
     num_classes = 10
     input_shape = (32, 32, 3)
     train_loader = DataLoader(
@@ -58,35 +42,33 @@ def setup_data(config):
         batch_size=config.train_batch_size,
         shuffle=True,
         num_workers=os.cpu_count(),
-        prefetch_factor=FLAGS.loader_prefetch_fator
-    )
-    
+        prefetch_factor=config.loader_prefetch_factor
+    )    
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.val_batch_size,
         shuffle=True,
         num_workers=os.cpu_count(),
-        prefetch_factor=FLAGS.loader_prefetch_fator
+        prefetch_factor=config.loader_prefetch_factor
     )
     
     return num_classes, input_shape, train_loader, val_loader
 
 
-
-def make_model(num_classes, norm=nn.BatchNorm):
-    return densenet_(num_classes, norm)
-
 def main(_):
-    config = config_dict.ConfigDict(FLAGS.config)
+    config = get_config()
     wandb.init(project="learning-jax-1")
-    wandb.config.update(config.to_dict())
+    wandb.config.update(vars(config))
     num_classes, input_shape, train_loader, val_loader = setup_data(config)
     
-    model = make_model(config, num_classes, input_shape)
+    norm_kwargs = lambda train: {"use_running_average": not train}
+    model = densenet_(num_classes=num_classes, norm=nn.BatchNorm)
     rng_init, _ = jax.random.split(jax.random.PRNGKey(0))
-    params = model.init(rng_init, jnp.zeros((1,) + input_shape))
-    
+    init_vars = model.init(rng_init, jnp.zeros((1,) + input_shape), norm_kwargs=norm_kwargs(train=True))
+    params, batch_stats = init_vars["params"], init_vars["batch_stats"]
+
+    print("num params: ")
     total_steps = config.epochs * len(train_loader)
     schedule = optax.cosine_decay_schedule(config.init_learning_rate, total_steps)
     optimizer = optax.sgd(schedule, momentum=.9)
@@ -94,61 +76,91 @@ def main(_):
     
     log_loss = jax.vmap(jaxopt.loss.multiclass_logistic_loss)
     
-    def objective_fn(labels, logits):
-        loss = jnp.mean(log_loss(labels, logits))    
-        wd_params = tree_util.tree_leaves(params)
-        reg_term = .5 * sum(jnp.sum(jnp.square(x) for x in wd_params))
+    
+    def objective_fn(params, mutable_vars, images, labels):        
+        model_vars = {"params": params, **mutable_vars}
+        logits, mutated_vars = model.apply(
+            model_vars,
+            images,
+            norm_kwargs=norm_kwargs(train=True),
+            mutable=list(mutable_vars.keys())
+        )
+        loss = jnp.mean(log_loss(labels, logits))
+        params_ = list(tree_util.tree_leaves(params))
+        reg_term = .5 * sum(jnp.sum(jnp.square(x)) for x in params_)
         objective = loss + config.weight_decay * reg_term
-        return objective
+        return objective, (logits, mutated_vars)
+
     
     @jax.jit
-    def train_step(optimizer_state, params, data):
-        inputs, labels = data
-        logits = model.apply(params, inputs)
-        loss = objective_fn(labels, logits)
-        grads = jax.grad(objective_fn)(labels, logits)
+    def train_step(optimizer_state, params, mutable_vars, images, labels):
+        objective_grad = jax.value_and_grad(objective_fn, has_aux=True)
+        (objective, aux), grads = objective_grad(params, mutable_vars, images, labels)
+        logits, mutated_vars = aux
         updates, optimizer_state = optimizer.update(grads, optimizer_state)
         params = optax.apply_updates(params, updates)
-        return optimizer_state, params, logits, loss
-    
-
-    for epoch in range(1, config.epochs+1):
+        return optimizer_state, params, mutated_vars, objective, logits
         
+    @jax.jit
+    def apply_model(params, batch_stats, images):
+        return model.apply(
+            {"params": params, "batch_stats": batch_stats}, 
+            images, 
+            norm_kwargs=norm_kwargs(train=False)
+        )
+    
+    for epoch in range(1, config.epochs+1):
         metrics = collections.defaultdict(list)
         pb = tqdm(train_loader, f"epoch {epoch}/{config.epochs}:")
-        for inputs, labels in pb:
-            inputs, labels = jnp.asarray(inputs.numpy()), jnp.asarray(labels.numpy())
-            inputs = jnp.moveaxis(inputs, -3, -1)
-            optimizer_state, params, logits, loss = train_step(
-                optimizer_state, params, (inputs, labels)
-            )
+        for images, labels in pb:
+            images, labels = jnp.asarray(images.numpy()), jnp.asarray(labels.numpy())
+            images = jnp.moveaxis(images, -3, -1)
             
-            preds = jnp.argmax(logits)
-            acc = (preds == logits)
+            optimizer_state, params, mutated_vars, objective, logits = train_step(
+                optimizer_state, params, {"batch_stats": batch_stats}, images, labels
+            )
+            batch_stats = mutated_vars["batch_stats"]
+            loss = log_loss(labels, logits)            
+            preds = jnp.argmax(logits, axis=-1)
+            acc = (preds == labels)
             metrics["train/acc"].append(acc)
             metrics["train/loss"].append(loss)
 
+
+        # shapes = []
+        # for k, v in metrics.items():
+        #     v_shapes = set([v_i.shape for v_i in v])
+        #     shapes.append((k, v_shapes))
+
+        # print(shapes)
+        # raise Exception()
         metrics.update({
-            k: np.array(v).mean() 
-            for k, v in metrics.items() if k.startswith("train")
+            k: np.concatenate(v).mean()
+            for k, v in metrics.items()
         })
         
  
         pb = tqdm(val_loader, "val")
-        for inputs, labels in pb:
-            inputs, labels = jnp.asarray(inputs.numpy()), jnp.asarray(labels.numpy())
-            inputs = jnp.moveaxis(inputs, -3, -1)
-            logits = model.apply(params, inputs)
+        for images, labels in pb:
+            images, labels = jnp.asarray(images.numpy()), jnp.asarray(labels.numpy())
+            images = jnp.moveaxis(images, -3, -1)
+            
+            logits = apply_model(params, batch_stats, images)
+            loss = log_loss(labels, logits)
+            loss = log_loss(labels, logits)
+            
             pred = jnp.argmax(logits, axis=-1)
-            loss = objective_fn(labels, logits)
             acc = (pred == labels)
+            
             metrics["val/acc"].append(acc)
             metrics["val/loss"].append(loss)
 
         metrics.update({
-            k: np.array(v).mean()
-            for k, v in metrics.items() if k.startswith("val")
+            k: np.concatenate(v).mean()
+            for k, v in metrics.items() if k.startswith("val")            
         })
+
+        wandb.log(metrics)
 
 
 if __name__ == "__main__":
