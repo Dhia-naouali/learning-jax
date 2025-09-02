@@ -62,7 +62,11 @@ class RoPEAttention(nn.Module):
             axis=-1 # along the query axis
         )
         
-        attn_scores = nn.Dropout(self.dropout_rate)(attn_scores, deterministic=deterministic)
+        attn_scores = nn.Dropout(self.dropout_rate)(
+            attn_scores, 
+            deterministic=deterministic,
+            rng=None if deterministic else self.make_rng("dropout")
+        )
         attn = jnp.einsum("bhqk, bhvd -> bhqd", attn_scores, v) # leading with the query dim
 
         # back to b, n, emb_dim
@@ -101,7 +105,7 @@ class MLP(nn.Module):
     def __call__(self, x, deterministic):
         x = nn.Dense(self.hidden_dim)(x)
         x = nn.gelu(x)
-        x = nn.Dropout(self.dropout_rate)(x, deterministic=deterministic)
+        x = nn.Dropout(self.dropout_rate)(x, deterministic=deterministic, rng=None if deterministic else self.make_rng("dropout"))
         x = nn.Dense(self.out_dim)(x)
         return x
 
@@ -110,7 +114,8 @@ class MLP(nn.Module):
 class DropPath(nn.Module):
     drop_rate: float
     
-    def _drop_path(self, x, rng):
+    def _drop_path(self, x):
+        rng = self.make_rng("drop_path")
         keep_prob = 1 - self.drop_rate
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         mask = jax.random.bernoulli(rng, p=keep_prob, shape=shape).astype(x.dtype)
@@ -118,23 +123,13 @@ class DropPath(nn.Module):
         
 
     @nn.compact
-    def __call__(self, x, deterministic, rng=None):
-        jax.debug.print("{a}, {c}, {b}", a=self.__class__.__name__, c=deterministic, b=rng, ordered=True)
+    def __call__(self, x, deterministic):
         return jax.lax.cond(
             deterministic | (self.drop_rate == 0),
             lambda x: x,
-            lambda x: self._drop_path(x, rng),
+            lambda x: self._drop_path(x),
             x
         )
-        # if deterministic or self.drop_rate == 0:
-        #     return x
-        # if rng is None:
-        #     rng = self.make_rng("drop_path")
-        # keep_prob = 1 - self.drop_rate
-        
-        # shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        # mask = jax.random.bernoulli(rng, p=keep_prob, shape=shape).astype(x.dtype)
-        # return x * mask / keep_prob
 
 
 class ViTBlock(nn.Module):
@@ -145,11 +140,7 @@ class ViTBlock(nn.Module):
     drop_path_rate: float = .1
     
     @nn.compact
-    def __call__(self, x, deterministic, rng=None):
-        jax.debug.print("{a}, {c}, {b}", a=self.__class__.__name__, c=deterministic, b=rng, ordered=True)
-        key1 = key2 = None
-        if rng is not None:
-            key1, key2 = jax.random.split(rng, 2)
+    def __call__(self, x, deterministic):
         
         x_res = x
         x = nn.LayerNorm()(x)
@@ -158,7 +149,7 @@ class ViTBlock(nn.Module):
             embed_dim=self.embed_dim,
             dropout_rate=self.dropout_rate
         )(x, deterministic=deterministic)
-        x = DropPath(self.drop_path_rate)(x, deterministic=deterministic, rng=key1)
+        x = DropPath(self.drop_path_rate)(x, deterministic=deterministic)
         x_res = x + x_res
         
         x = nn.LayerNorm()(x)
@@ -167,7 +158,7 @@ class ViTBlock(nn.Module):
             out_dim=self.embed_dim,
             dropout_rate=self.dropout_rate
         )(x, deterministic=deterministic)
-        x = DropPath(self.drop_path_rate)(x, deterministic=deterministic, rng=key2)
+        x = DropPath(self.drop_path_rate)(x, deterministic=deterministic)
         
         return x + x_res
 
@@ -180,7 +171,6 @@ class ViT(nn.Module):
         self.patch_embed = PatchEmbed(
             self.config.patch_size, self.config.embed_dim
         )
-        # num_patches = (self.config.image_size // self.config.patch_size) ** 2
         self.cls_token = self.param(
             "cls_token", 
             nn.initializers.normal(stddev=.02), 
@@ -202,19 +192,13 @@ class ViT(nn.Module):
         self.head = nn.Dense(self.config.num_classes)
         
         
-    def __call__(self, x, deterministic, rngs=None):
-        rngs = rngs or {}
-        
+    def __call__(self, x, deterministic):        
         x = self.patch_embed(x)
         cls_token = jnp.tile(self.cls_token, (x.shape[0], 1, 1))
         x = jnp.concatenate([cls_token, x], axis=1)
         
-        main_key = rngs.get("drop_path", None)
         for block in self.blocks:
-            if main_key:
-                main_key, key = jax.random.split(main_key)
-            else :key = None
-            x = block(x, deterministic=deterministic, rng=key)
+            x = block(x, deterministic=deterministic)
         x = self.norm(x)
         cls_token = x[:, 0]
         return self.head(cls_token)

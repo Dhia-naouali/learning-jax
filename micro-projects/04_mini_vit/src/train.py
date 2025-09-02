@@ -2,15 +2,14 @@ import time
 import wandb
 import argparse
 import collections
+import numpy as np
 from tqdm import tqdm
-from functools import partial
 
 import jax
 import optax
 import jaxopt
 import jax.numpy as jnp
 from flax.training import checkpoints
-from flax.training.train_state import TrainState
 
 from models import ViT, ViTConfig
 from data import make_loader
@@ -37,55 +36,77 @@ def main():
     
     model = ViT(config)
     train_loader, val_loader = make_loader(args.data_dir, args.batch_size)
-    
     main_key = jax.random.PRNGKey(12)
     main_key, init_key = jax.random.split(main_key)
-    input_shape = (1, config.image_size, config.image_size, 3)
     
     main_key, dp_key, pd_key = jax.random.split(main_key, 3)
     params = model.init(
-        init_key, 
-        jnp.zeros(input_shape), 
-        deterministic=True,
-        rngs = {
-                "dropout": dp_key,
-                "path_drop": pd_key
-        }
-    )
+        {
+            "params": init_key,
+            "dropout": dp_key,
+            "drop_path": pd_key
+        },
+        jnp.zeros((1, config.image_size, config.image_size, 3)),
+        deterministic=False,
+    )["params"]
+
     optimizer = optax.adamw(learning_rate=args.lr, weight_decay=args.wd)
-    state = TrainState.create(
-        apply_fn=model.apply,
-        params=params,
-        tx=optimizer
-    )
-
-    # loss thingies
-    log_loss = jax.vmap(jaxopt.loss.multiclass_logistic_loss)
+    optimizer_state = optimizer.init(params)
     
-    def loss_fn(params, images, labels, rngs: dict=None):
-        logits = state.apply_fn(params, images, deterministic=rngs is None, rngs=rngs)
-        loss = log_loss(logits, labels).mean()
+    def loss_fn(params, images, labels, rng):
+        dp_key, pd_key = jax.random.split(rng)
+        rngs = {
+            "dropout": dp_key,
+            "drop_path": pd_key
+        }
+        logits = model.apply(
+            {"params": params},
+            images,
+            deterministic=False, 
+            rngs=rngs
+        )
+        loss = jaxopt.loss.multiclass_logistic_loss(labels, logits).mean()
         return loss, logits
-
-    loss_grad = jax.value_and_grad(loss_fn, has_aux=True)
     
+    loss_grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+
+    @jax.jit
+    def train_step(params, optimizer_state, images, labels, rng):
+        (loss, logits), grads = loss_grad_fn(params, images, labels, rng)
+        updates, optimizer_state = optimizer.update(grads, optimizer_state, params=params)
+        params = optax.apply_updates(params, updates)
+        
+        preds = jnp.argmax(logits, axis=-1)
+        acc = jnp.mean(preds == labels)
+        return params, optimizer_state, loss, acc
+    
+    @jax.jit
+    def val_step(params, images, labels):
+        logits = model.apply({"params": params}, images, deterministic=True)
+        loss = jaxopt.loss.multiclass_logistic_loss(labels, logits).mean()
+        preds = jnp.argmax(logits, axis=-1)
+        acc = jnp.mean(preds == labels)
+        return loss, acc
+
     wandb.init(project="learning-jax-4-ViT", config=vars(config))
     for epoch in range(1, args.epochs+1):
         epoch_start = time.time()
         metrics = collections.defaultdict(list)
         for images, labels in tqdm(train_loader):
-            images, labels = jnp.asarray(images.numpy()), jnp.asarray(labels.numpy())
+            images = jnp.array(np.array(images)).astype(jnp.float32)
+            labels = jnp.array(np.array(labels)).astype(jnp.int32)
             images = jnp.moveaxis(images, -3, -1)
-
-            main_key, dp_key, pd_key = jax.random.split(main_key, 3)
-            rngs = {
-                "dropout": dp_key,
-                "path_drop": pd_key
-            }
-            state, loss, acc = train_step(state, images, labels, rngs, loss_grad)
+            main_key, train_key = jax.random.split(main_key)
+            params, optimizer_state, loss, acc = train_step(
+                params, 
+                optimizer_state,
+                images,
+                labels,
+                train_key
+            )
             metrics["train/loss"].append(float(loss))
             metrics["train/acc"].append(float(acc))
-        
+
         metrics = {
             k: jnp.array(v).mean() for k, v in metrics.items()
         }
@@ -93,40 +114,19 @@ def main():
         wandb.log(metrics)
 
 
-        epoch_start = time.time()
         metrics = collections.defaultdict(list)
         for images, labels in tqdm(val_loader):
-            images, labels = jnp.asarray(images.numpy()), jnp.asarray(labels.numpy())
+            images = jnp.array(np.array(images)).astype(jnp.float32)
+            labels = jnp.array(np.array(labels)).astype(jnp.int32)
             images = jnp.moveaxis(images, -3, -1)
-
-            loss, acc = val_step(state, images, labels, log_loss)
+            loss, acc = val_step(params, images, labels)
             metrics["val/loss"].append(float(loss))
             metrics["val/acc"].append(float(acc))
-        
+            
         metrics = {
             k: jnp.array(v).mean() for k, v in metrics.items()
         }
-        metrics["val/time"] = time.time() - epoch_start
-        wandb.log(metrics)    
-
-
-@partial(jax.jit, static_argnums=(4,))
-def train_step(state, images, labels, rngs, loss_grad):
-    (loss, logits), grads = loss_grad(state.params, images, labels, rngs=rngs)
-    state = state.apply_gradients(grads)
-    preds = jnp.argmax(logits, axis=-1)
-    acc = (preds == labels).mean()
-    return state, loss, acc
-
-
-@jax.jit
-def val_step(state, images, labels):
-    logits = state.apply_fn(state.params, images, deterministic=True, rngs=None)
-    loss = jaxopt.loss.multiclass_logistic_loss(logits, labels).mean()
-    preds = jnp.argmax(logits, axis=-1)
-    acc = (preds == labels).mean()
-    return loss, acc
-
+        wandb.log(metrics)  
 
 
 if __name__ == "__main__":
