@@ -110,17 +110,31 @@ class MLP(nn.Module):
 class DropPath(nn.Module):
     drop_rate: float
     
-    @nn.compact
-    def __call__(self, x, deterministic, rng=None):
-        if deterministic or self.drop_rate == 0:
-            return x
-        if rng is None:
-            rng = self.make_rng("drop_path")
+    def _drop_path(self, x, rng):
         keep_prob = 1 - self.drop_rate
-        
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         mask = jax.random.bernoulli(rng, p=keep_prob, shape=shape).astype(x.dtype)
         return x * mask / keep_prob
+        
+
+    @nn.compact
+    def __call__(self, x, deterministic, rng=None):
+        jax.debug.print("{a}, {c}, {b}", a=self.__class__.__name__, c=deterministic, b=rng, ordered=True)
+        return jax.lax.cond(
+            deterministic | (self.drop_rate == 0),
+            lambda x: x,
+            lambda x: self._drop_path(x, rng),
+            x
+        )
+        # if deterministic or self.drop_rate == 0:
+        #     return x
+        # if rng is None:
+        #     rng = self.make_rng("drop_path")
+        # keep_prob = 1 - self.drop_rate
+        
+        # shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        # mask = jax.random.bernoulli(rng, p=keep_prob, shape=shape).astype(x.dtype)
+        # return x * mask / keep_prob
 
 
 class ViTBlock(nn.Module):
@@ -132,6 +146,7 @@ class ViTBlock(nn.Module):
     
     @nn.compact
     def __call__(self, x, deterministic, rng=None):
+        jax.debug.print("{a}, {c}, {b}", a=self.__class__.__name__, c=deterministic, b=rng, ordered=True)
         key1 = key2 = None
         if rng is not None:
             key1, key2 = jax.random.split(rng, 2)
