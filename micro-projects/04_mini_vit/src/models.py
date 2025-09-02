@@ -6,15 +6,15 @@ from dataclasses import dataclass
 
 @dataclass
 class ViTConfig:
-    image_size = 256
-    patch_size = 4
-    num_classes = 100
-    embed_dim = 384
-    mlp_dim = 384
-    num_layers = 4
-    num_heads = 4
-    dropout_rate = 0.12
-    drop_path_rate = 0.1
+    image_size: int = 256
+    patch_size: int = 4
+    num_classes: int = 100
+    embed_dim: int = 384
+    mlp_dim: int = 384
+    num_layers: int = 4
+    num_heads: int = 4
+    dropout_rate: float = 0.12
+    drop_path_rate: float = 0.1
     
 
 class PatchEmbed(nn.Module):
