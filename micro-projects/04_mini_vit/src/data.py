@@ -10,11 +10,11 @@ def make_loader(data_dir, batch_size=32):
     ])
     
     train_dataset = datasets.ImageFolder(
-        data_dir, transform=transform
+        os.path.join(data_dir, "train"), transform=transform
     )
     
     test_dataset = datasets.ImageFolder(
-        data_dir, transform=transform
+        os.path.join(data_dir, "valid"), transform=transform
     )
     
     train_loader = DataLoader(
