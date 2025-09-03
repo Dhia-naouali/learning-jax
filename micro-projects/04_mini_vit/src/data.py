@@ -21,14 +21,16 @@ def make_loader(data_dir, batch_size=32):
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=os.cpu_count()
+        num_workers=os.cpu_count(),
+        drop_last=True
     )
     
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=os.cpu_count()
+        num_workers=os.cpu_count(),
+        drop_last=True
     )
     
     return train_loader, test_loader
