@@ -114,8 +114,8 @@ class MLP(nn.Module):
 class DropPath(nn.Module):
     drop_rate: float
     
-    def _drop_path(self, x):
-        rng = self.make_rng("drop_path")
+    def _drop_path(self, x, deterministic):
+        rng = jax.random.key(12) if deterministic else self.make_rng("drop_path")
         keep_prob = 1 - self.drop_rate
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         mask = jax.random.bernoulli(rng, p=keep_prob, shape=shape).astype(x.dtype)
@@ -127,7 +127,7 @@ class DropPath(nn.Module):
         return jax.lax.cond(
             deterministic | (self.drop_rate == 0),
             lambda x: x,
-            lambda x: self._drop_path(x),
+            lambda x: self._drop_path(x, deterministic),
             x
         )
 
