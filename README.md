@@ -18,4 +18,5 @@
 
 | the thingy I tried | Main Learnings |
 |-------------|----------------|
-| [spmd_linear](trying-things-out/spmd_linear.py) |- FSDP linear layer |
+| [spmd_linear](trying-things-out/spmd_linear.py) | FSDP linear layer |
+| [step_bubble_benchmark](trying-things-out/step_bubble_benchmark.py) | asynchronous dispatch flow (load data batch & compute in ~parallel)|
